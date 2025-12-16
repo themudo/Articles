@@ -1,0 +1,508 @@
+---
+title: "RNA-seq-Kallisto"
+author: "Diego Robledo and Paularovi, with modifications by Gonçalo Themudo"
+output:
+  html_document:
+    df_print: paged
+params:
+  folder:
+    label:  path to kallisto folder
+    value: './data'
+    input: text
+  species:
+    label: Name of the species in ensembl (default USDA_OmykA_1.1)
+    value: 'USDA_OmykA_1.1'
+    input: select
+    choices: [USDA_Omyka_1.1, dlabrax2021, ASM1334776v1]
+  root:
+    label: path to analysis folder
+    value: './analysis'
+  conditions:
+    label: file with RNA seq study design
+    value:
+    input: file
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+This is an attempt to automate this analysis, by producing parameterized
+reports
+(<https://bookdown.org/yihui/rmarkdown/parameterized-reports.html>),
+i.e, you just have to specify some parameters in a popup box to run the
+analysis on different inputs. The markdown file will produce an html
+report of the analysis with different names based on the name of the
+Sequence name given above. To run, you need to either execute another
+file in R with the text:
+
+```         
+#rmarkdown::render("RNA-seq-kallisto_general.Rmd", params = "ask")
+```
+
+You can also run it within Rstudio, by opening this file and choosing
+Knit with parameters.
+
+
+# RNA-Seq differential expression analysis using Kallisto and DESeq2
+
+Here we describe a pipeline to analyse RNA sequencing data (NovaSeq 6000
+PE150).
+
+Overall, we need to \~ 1) check the quality of raw data (FASTQC
+analysis), 2) filter the raw data (FASTP), and 3) estimate the gene
+expression of the RNAseq data (KALLISTO).
+
+Kallisto is a program for quantifying abundances of transcripts from
+bulk RNA-Seq data. It is based on the pseudoalignment of reads against
+the transcriptome of a species for rapid estimation of transcript
+expression. Of note, this pipeline is described considering that the
+genome/transcriptome of the species that we are working with is publicly
+available.
+
+**TABLE OF CONTENTS** \* [1. Quality control with
+FastQC](#1-quality-control-with-FastQC) \* [2. Filtering using
+fastp](#2-filtering-using-fastp) \* [3. Quantification using
+kallisto](#3-quantification-using-kallisto) \* [4. Differential
+expression using DESeq2](#4-differential-expression-using-DESeq2)
+
+```{r setup}
+here::i_am("./RNA-seq-kallisto_general.Rmd")
+
+#knitr::opts_knit$set(root.dir = "C:/Users/gthemudo/Documents/AQUAVIP/kallisto/ensembl_ref/spleen")
+#knitr::opts_knit$set(root.dir = here::here("./kallisto/ensembl_ref/spleen"))
+#knitr::opts_knit$set(root.dir = params$folder)
+#knitr::opts_knit$set(root.dir = here::here("./data"))
+knitr::opts_knit$set(root.dir = here::here("../../grinnaqua/kallisto/gills"))
+```
+
+The results for each sample will be in a separate folder with the name
+of the sample (-o). That folder will contain three files: abundance.h5,
+abundance.tsv, and run_info.json
+
+## 4. Differential expression using DESeq2
+
+The remaining of the pipeline is performed in R, and requires the
+installation of various packages:
+
+```{r message=FALSE, include=FALSE}
+#Installation of packages. NEEDS only to run the first time.
+# if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install()
+# BiocManager::install("tximportData")
+# BiocManager::install("tximport")
+# install.packages("tidyverse")
+# BiocManager::install("Biostrings")
+# BiocManager::install("biomaRt")
+# #install biomartr 1.0.3
+# install.packages("biomartr", dependencies = TRUE)
+# BiocManager::install("DESeq2")
+# BiocManager::install('PCAtools')
+# BiocManager::install("EnhancedVolcano")
+# install.packages("pheatmap")
+# BiocManager::install("rhdf5")
+# install.packages("here")
+
+#Load libraries. Need to run every time you start R
+library(tximportData)
+library(tximport)
+library(readr)
+library(biomaRt)
+library(DESeq2)
+library(PCAtools)
+library(EnhancedVolcano)
+library("pheatmap")
+library(rhdf5)
+library(dplyr)
+library(magick)
+library(here)
+```
+
+### 4.1. Loading Kallisto expression estimates
+
+To read the output of Kallisto, we first store the route to the
+directory where the folders are, and move to that folder:
+
+```{r}
+#dir <- here::here(params$folder)
+#dir <- here::here("data")
+dir <- here::here("../../grinnaqua/kallisto/gills/")
+
+#setwd(dir)
+
+#We store the names of all the samples (the outputs of kallisto will be in folders with their names):
+
+#samples  <- list.files(full.names = FALSE, pattern = 'paired$')
+#samples <- list.dirs(path= dir, full.names = TRUE, no.. = TRUE)
+samples <- list.dirs(path= dir, full.names = FALSE)
+samples <- samples[-1]
+
+
+#And use this to generate an object with the path to the folder of each specific sample:
+
+files <- file.path(dir, samples, "abundance.h5")
+files <- file.path(samples, "abundance.h5")
+names(files) <- samples
+```
+
+By default, Kallisto quantifies the expression of every transcript in
+the transcriptome of the species (i.e. including the different isoforms
+for each gene), but in most scenarios we will be interested in obtaining
+gene-level differential expression. Therefore, we need to match the
+isoforms to genes. If we are using a reference transcriptome from
+Ensembl, we can get this information using the [biomaRt
+package](https://bioconductor.org/packages/release/bioc/html/biomaRt.html).
+
+```{r}
+#First we need to find the name of the database of our species:
+
+ensembl <- useEnsembl(biomart = "genes")
+#searchDatasets(mart = ensembl, pattern = "SPECIES")
+e_dataset <- searchDatasets(mart = ensembl, pattern = "USDA_OmykA_1.1")$dataset
+#e_dataset <- searchDatasets(mart = ensembl, pattern = params$species)$dataset
+#e_dataset <- searchDatasets(mart = ensembl, pattern = ASM1334776v1)$dataset
+
+#The search will return the datasets matching the pattern specified in "SPECIES". We can use this information to extract the species database with:
+
+#my_ensembl <- useEnsembl(biomart = "genes", dataset = "NAMEOFDATABASE")
+my_ensembl <- useEnsembl(biomart = "genes", dataset = e_dataset)
+#Now that we have identified our database, we need to extract the transcript ID with their version (as in the kallisto quantification files) and match them to their genes. We first identify how these two sets are named in this ensembl database. The listAttributes() function displays all available attributes in the selected dataset:
+
+attributes = listAttributes(my_ensembl)
+head(attributes)
+
+#To match transcripts and genes, we want to select the attributes "ensembl_transcript_id_version" and "ensembl_gene_id". We can extract that information for the whole genome:
+
+transcript2gene <- getBM(attributes=c("ensembl_transcript_id_version", "ensembl_gene_id"), mart = my_ensembl, values="")
+```
+
+```{r}
+#Now we are finally ready to load the Kallisto expression estimates into R using tximport:
+
+txi.kallisto.tsv <- tximport(files, type = "kallisto", tx2gene = transcript2gene)
+```
+
+```{r}
+### 4.2. Differential expression analyses
+#We will perform differential expression using [DESeq2](https://bioconductor.org/packages/release/bioc/html/DESeq2.html). To perform differential expression, the first step is to generate a file with the phenotypes. I usually do this outside R (creating manually a tab-delimited file), but it is also relatively easy to do in R. We first generate an empty vector with the dimensions that we want. Let´s say we have 12 samples and 2 conditions, then we need 12 rows and 2 columns (which we can already name):
+
+#phenotypes = data.frame(matrix(vector(), length(files), 2, dimnames=list(c(), c("Condition1", "Condition2"))),stringsAsFactors=F)
+phenotypes = data.frame(matrix(vector(), length(files), 4, dimnames=list(c(), c("tissue", "time", "treatment", "diet"))),stringsAsFactors=F)
+
+#Now we add the names of the samples as row names:
+
+
+row.names(phenotypes) <- names(txi.kallisto.tsv$infReps)
+
+#phenotypes <- phenotypes[order(match(conditions$Samples, rownames(phenotypes))), , drop = FALSE]
+```
+
+####Gills
+
+```{r}
+#And now we can add the phenotypes for each sample using a vector:
+#conditions <- read.csv("C:/Users/gthemudo/Documents/IGNITION/rna_seq_conditions.csv",sep=";",header = TRUE)
+
+library(readr)
+conditions <- read_delim("C:/Users/gthemudo/Documents/grinnaqua/grinnaqua_seq_conditions.csv", 
+#conditions <- read_delim(params$conditions, 
+    delim = ",", escape_double = FALSE, col_types = cols(Treatment = col_character(), 
+        Time = col_integer(),  
+        Tissue = col_character(),
+        Diet = col_character()), 
+    trim_ws = TRUE)
+conditions$Treatment[conditions$Treatment == "Non-infected"] <- "control"
+
+conditions <- conditions[order(match(conditions$Samples, samples)),]
+
+#row.names(phenotypes) <- conditions$Samples
+#These lines are assay specific, difficult to generalise
+conditions <- conditions[,]
+conditions <- conditions[conditions$Tissue == "Gills",]
+phenotypes$diet <- as.factor(conditions$Diet)
+phenotypes$time <- as.factor(conditions$Time)
+phenotypes$tissue <- as.factor(conditions$Tissue)
+phenotypes$treatment <- as.factor(conditions$Treatment)
+phenotypes <- phenotypes[phenotypes$tissue == "Gills",]
+```
+
+And that generates the object with need with the phenotypes of each
+sample. As mentioned above, it can also just be generated outside R and
+loaded as a dataframe with something like "phenotypes \<-
+read.delim('phenotypes.txt', row.names=1)", which is probably more
+convenient when there are many samples and / or a complex design.
+
+With our expression matrix and our phenotypes, now we are finally ready
+to generate the DESeq2 object that we are going to use for differential
+expression:
+
+```{r}
+data <- DESeqDataSetFromTximport(txi = txi.kallisto.tsv, colData = phenotypes, design = ~ time + diet + treatment)
+```
+
+The "design" part of the expression is key. It tells DESeq2 what it
+needs to test, with the last element being the condition that we want to
+compare, and previous terms representing potential batch effects. The
+design can be considerably more complex, including interaction terms
+(see [DESeq2
+vignette](https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html)).
+It can also be modified later on if necessary (and we will show how
+below).
+
+At this stage and prior to differential expression, it is sensible to
+explore the overall clustering of the samples to ensure that they behave
+as expected and discard potential mixing of samples in previous steps.
+To do so, the data first needs to be normalised, otherwise the most
+expressed genes would have a very large weight. The raw expression data
+can be normalised with a variance stabilizing transformation, included
+as part of DESeq2:
+
+```{r}
+vsd <- varianceStabilizingTransformation(data)
+```
+
+And to have a quick visualisation of the data, we can use a Principal
+Components Analysis (PCA) using the DESeq2 function:
+
+```{r}
+
+plotPCA(vsd, intgroup = c("treatment"))
+plotPCA(vsd, intgroup = c("treatment", "time"))
+plotPCA(vsd, intgroup = c("time", "diet"))
+plotPCA(vsd, intgroup = c("treatment", "diet"))
+plotPCA(vsd, intgroup = c("treatment", "time", "diet"))
+plotPCA(vsd, intgroup = c("diet"))
+plotPCA(vsd, intgroup = c("time"))
+```
+
+However, the options of this function are quite limited, and the figure
+in not very pretty, so it is better to use the package PCAtools, which
+also allows visualising the percentage explained by each PCA and
+plotting more than two PCAs in the same graph. The use of colours and
+shapes to represent the different conditions also facilitates the
+interpretation of the PCA results.
+
+```{r}
+#This is a guess, count_info was not defined in original script
+count_info <- t(txi.kallisto.tsv$counts)
+samples1 <- list.dirs(path= dir, full.names = FALSE)
+samples1 <- samples1[-1]
+count_info <- conditions[match(samples1, conditions$Samples),]
+rownames(count_info) <- count_info$Samples
+
+p <- pca(assay(vsd), metadata = count_info, removeVar = 0.1)
+screeplot(p)   #Percentage explained by each PCA
+
+```
+
+```{r}
+#biplot(p, colby = "diet", shape="stress", legendPosition = 'top', lab = NULL, legendLabSize = 12, legendIconSize = 6, title = "", pointSize=5)
+biplot(p, legendPosition = 'top', lab = NULL, legendLabSize = 12, legendIconSize = 6, title = "", pointSize=5)
+
+#pairsplot(p, components = c(1:5), triangle = TRUE, trianglelabSize = 12, hline = 0, vline = 0, pointSize = 1, gridlines.major = FALSE, gridlines.minor = FALSE, title = 'Pairs plot', plotaxes = FALSE, margingaps = unit(c(-0.01, -0.01, -0.01, -0.01), 'cm'), colby = 'diet', shape="stress")
+pairsplot(p, components = c(1:5), triangle = TRUE, trianglelabSize = 12, hline = 0, vline = 0, pointSize = 1, gridlines.major = FALSE, gridlines.minor = FALSE, title = 'Pairs plot', plotaxes = FALSE, margingaps = unit(c(-0.01, -0.01, -0.01, -0.01), 'cm'))
+```
+
+Inspection of the PCA results might lead to the removal of some samples
+if they are not clustered as expected or to review previous steps and
+correction of sample assignments.
+
+```{r}
+dds <- DESeq(data)
+
+#This will compute the comparisons between all the groups in the "combined" variable. To extract the results for a specific comparison:
+resultsNames(dds)
+res <- results(dds, contrast=c("treatment", "Infected", "control"))
+res_Diet <- results(dds, contrast=c("diet", "MET", "CTRL"))
+res_24 <- results(dds, contrast=c("time", "24", "0"))
+res_72 <- results(dds, contrast=c("time", "72", "0"))
+res_120 <- results(dds, contrast=c("time", "120", "0"))
+```
+
+Once we are certain our samples are well classified, we can perform
+differential expression. As mentioned above, the design variable is key,
+and you will have to adjust it as necessary. If "Condition1" represents
+a batch effect, and "Condition2" is the one we want to test, the above
+design is fine. However, if both variables are important, and we want to
+test the different combinations, it is better to generate a new variable
+that combines both original variables.
+
+```{r}
+data$combined <- factor(paste0(data$treatment, data$diet))
+
+#And now we can change the design to test differences in expression according to that variable
+
+design(data) <- ~ combined
+
+#And now we can run the differential expression test. 
+
+dds <- DESeq(data)
+
+#This will compute the comparisons between all the groups in the "combined" variable. To extract the results for a specific comparison:
+resultsNames(dds)
+res_treatment <- results(dds, contrast=c("combined", "InfectedCTRL", "controlCTRL")) 
+res_diet <- results(dds, contrast=c("combined", "controlMET", "controlCTRL")) 
+res_treatmentxdiet <- results(dds, contrast=c("combined", "InfectedMET", "controlCTRL"))
+```
+
+Keep in mind that the order of the variables is important to estimate
+fold changes, the first one is the numerator and the second one the
+denominator.
+
+The object "res" has the results of the differential expression for that
+comparisons (p-values, fold changes and other statistics), but each gene
+is only identified with its Ensembl ID. We can again use BiomaRt to
+obtain their annotation. We can check the "attributes" object again
+("attributes = listAttributes(my_ensembl)") and select the ones we are
+interested in. We will also need the geneID to match it to our data,
+which we will assign as the name of the rows.
+
+```{r}
+annotation <- getBM(attributes=c("ensembl_gene_id", "external_gene_name","description"), mart = my_ensembl, values="")
+row.names(annotation) <- annotation$ensembl_gene_id
+annotation <- annotation[-1]
+
+#we match the annotation and the differential expression results:
+
+res_annotated <- merge(DataFrame(res), annotation, all.x = TRUE, by = "row.names")
+res_treatment_annotated <- merge(DataFrame(res_treatment), annotation, all.x = TRUE, by = "row.names")
+res_diet_annotated <- merge(DataFrame(res_diet), annotation, all.x = TRUE, by = "row.names")
+res_treatmentxdiet_annotated <- merge(DataFrame(res_treatmentxdiet), annotation, all.x = TRUE, by = "row.names")
+
+#We can  order the results by adjusted p-value and filter those below your threshold of choice (will potentially depend on the number of differentially expressed genes)
+
+res_annotated_filtered <- subset(res_annotated[order(res_annotated$padj),], padj < 0.05)
+res_treatment_annotated_filtered <- subset(res_treatment_annotated[order(res_treatment_annotated$padj),], padj < 0.05)
+res_diet_annotated_filtered <- subset(res_diet_annotated[order(res_diet_annotated$padj),], padj < 0.05)
+res_treatmentxdiet_annotated_filtered <- subset(res_treatmentxdiet_annotated[order(res_treatmentxdiet_annotated$padj),], padj < 0.05)
+
+#Finally, we can save the file in a tab-delimited format to allow inspection using Excel or similar
+
+write.table(as.data.frame(res_annotated_filtered),file="grinnaqua_DE_results_gills.txt", sep="\t", row.names = FALSE)
+write.table(as.data.frame(res_treatment_annotated_filtered),file="grinnaqua_DE_results_treatment_gills.txt", sep="\t", row.names = FALSE)
+write.table(as.data.frame(res_diet_annotated_filtered),file="grinnaqua_DE_results_diet_gills.txt", sep="\t", row.names = FALSE)
+write.table(as.data.frame(res_treatmentxdiet_annotated_filtered),file="grinnaqua_DE-results_treatmentxdiet_gills.txt", sep="\t", row.names = FALSE)
+```
+
+```{r}
+### 4.3. Visualization
+#An important aspect of any RNA-seq analysis is the visualization of the results. RNA-seq data can be extracted an ploted using any normal software as barplots, boxplots, etc. Here we will show a few that are typical of RNA-seq analyses
+
+#### Volcano Plots
+#Volcano plots represent the results of a differential expression test. While DESeq2 has an integrated volcano plot, the packages EnhancedVolcano draws nicer and more customisable plots. It takes the results of DESeq2 as input.
+
+EnhancedVolcano(res_annotated, x="log2FoldChange", y="padj", lab = "")
+#EnhancedVolcano(res_treatment_annotated, x="log2FoldChange", y="padj", lab = "")
+#EnhancedVolcano(res_diet_annotated, x="log2FoldChange", y="padj", lab = "")
+#EnhancedVolcano(res_treatmentxdiet_annotated, x="log2FoldChange", y="padj", lab = "")
+
+
+### Heatmaps
+#There are multiple packages to facilitate drawing heatmaps, here we will use pheatmap to draw a heatmap for the 50 top differentially expressed genes according to p-value. First we obtain the IDs of those 50 genes:
+
+#top50 <- res_annotated[1:50,1]
+top50 <- res_annotated_filtered[1:50,1]
+top50_treatment <- res_treatment_annotated_filtered[1:50,1]
+#top50_diet <- res_diet_annotated_filtered[1:50,1]
+#top50_diet <- res_diet_annotated_filtered[1:9,1]
+top50_treatmentxdiet <- res_treatmentxdiet_annotated_filtered[1:50,1]
+
+#The heatmaps are generally drawn with normalised expression values. We can use the "vsd" object generated before. The "assay" option can extract the expression values from "vsd", and we want to do it just for the top50 genes:
+
+top50_expression <- assay(vsd[top50])
+top50_treatment_expression <- assay(vsd[top50_treatment])
+#top50_diet_expression <- assay(vsd[top50_diet])
+top50_treatmentxdiet_expression <- assay(vsd[top50_treatmentxdiet])
+
+#To allow the visualization of all these genes together, the expression values are usually mean centered.
+
+top50_expression  <- top50_expression - rowMeans(top50_expression)
+top50_treatment_expression  <- top50_treatment_expression - rowMeans(top50_treatment_expression)
+#top50_diet_expression  <- top50_diet_expression - rowMeans(top50_diet_expression)
+top50_treatmentxdiet_expression  <- top50_treatmentxdiet_expression - rowMeans(top50_treatmentxdiet_expression)
+
+#Now we can draw the heatmap with
+
+pheatmap(top50_expression, cluster_cols=FALSE, fontsize_row=6)
+pheatmap(top50_treatment_expression, cluster_cols=FALSE, fontsize_row=6)
+#pheatmap(top50_diet_expression, cluster_cols=FALSE, fontsize_row=6)
+pheatmap(top50_treatmentxdiet_expression, cluster_cols=FALSE, fontsize_row=6)
+
+#We can add colours to identify the different sample groups, and also replace the Ensembl IDs with gene names
+
+
+annot <- as.data.frame(colData(vsd)[, c("treatment","diet", "time")])
+##THIS IS NOT WORKING FOR SOME REASON
+#gene_names <- res_annotated[1:50,"ensembl_gene_id"]
+gene_names <- res_annotated[1:50,"external_gene_name"]
+gene_names <- res_treatment_annotated[1:50,"external_gene_name"]
+#gene_names <- res_diet_annotated[1:50,"external_gene_name"]
+#gene_names <- res_diet_annotated[1:9,"external_gene_name"]
+gene_names <- res_treatmentxdiet_annotated[1:50,"external_gene_name"]
+
+pheatmap(top50_expression, annotation_col = annot, labels_row = gene_names, cluster_cols=FALSE, fontsize_row=6)
+pheatmap(top50_expression, annotation_col = annot, cluster_cols=FALSE, fontsize_row=6)
+pheatmap(top50_expression, annotation_col = annot, cluster_cols=FALSE, cluster_rows=FALSE, fontsize_row=6)
+
+### Expression of individual genes
+#The function "plotCounts" of DESeq2 has is used to plot the normalised expression of genes
+
+plotCounts(dds, gene=top50[1], intgroup=c("treatment","diet", "time"))
+
+#Again, it is possible to draw better plots. For this, we can usse ggplot2, a package to draw figure in R which deserves its own whole course.
+
+# d <- plotCounts(dds, gene=top50[1], intgroup="treatment", returnData = TRUE)
+# ggplot(d, aes(x=time, y=count, col=treatment)) + geom_point(position=position_jitter(w=0.1,h=0), size=1.5) + scale_y_log10() + theme_bw()
+# d <- plotCounts(dds, gene=top50[2], intgroup="treatment", returnData = TRUE)
+# ggplot(d, aes(x=time, y=count, col=treatment)) + geom_point(position=position_jitter(w=0.1,h=0), size=1.5) + scale_y_log10() + theme_bw()
+# d <- plotCounts(dds, gene=top50[3], intgroup="treatment", returnData = TRUE)
+# ggplot(d, aes(x=time, y=count, col=treatment)) + geom_point(position=position_jitter(w=0.1,h=0), size=1.5) + scale_y_log10() + theme_bw()
+
+```
+
+```{r}
+all <- res_annotated_filtered[,1]
+
+#The heatmaps are generally drawn with normalised expression values. We can use the "vsd" object generated before. The "assay" option can extract the expression values from "vsd", and we want to do it just for the top50 genes:
+
+all_expression <- assay(vsd[all])
+
+#To allow the visualization of all these genes together, the expression values are usually mean centered.
+
+all_expression  <- all_expression - rowMeans(all_expression)
+
+gene_names_all <- res_annotated[,"external_gene_name"]
+
+pheatmap(all_expression, annotation_col = annot, cluster_cols=FALSE, fontsize_row=6)
+
+```
+
+```{r}
+padj05 <- res_annotated_filtered[res_annotated_filtered$padj<0.05,1]
+
+#The heatmaps are generally drawn with normalised expression values. We can use the "vsd" object generated before. The "assay" option can extract the expression values from "vsd", and we want to do it just for the top50 genes:
+
+all_expression <- assay(vsd[all])
+
+#To allow the visualization of all these genes together, the expression values are usually mean centered.
+
+all_expression  <- all_expression - rowMeans(all_expression)
+
+gene_names_all <- res_annotated[,"external_gene_name"]
+
+pheatmap(all_expression, annotation_col = annot, cluster_cols=FALSE, cluster_rows=FALSE, fontsize_row=6)
+
+```
+
+Including code to produce the same graphs and tables as g::prof
+```{r}
+library(gprofiler2)
+
+gost_res <- gost(res_annotated_filtered@listData$Row.names[1:50],organism = 'omykiss',ordered_query = TRUE)
+gostplot(gost_res)
+p <- gostplot(gost_res, capped = FALSE, interactive = FALSE)
+p
+
+#publish_gostplot(p)
+```
+
